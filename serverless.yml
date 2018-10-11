@@ -1,0 +1,321 @@
+service: serverless-deep-dream
+
+provider:
+  name: aws
+  runtime: nodejs8.10
+  stage: dev
+  region: us-east-1
+  iamRoleStatements:
+    - Effect: Allow
+      Action: ecs:runTask
+      Resource: ${self:custom.prefixes.taskDefinitionArn}${self:custom.taskDefinitionName}:*
+    - Effect: Allow
+      Action: ecs:ListTaskDefinitions
+      Resource: '*'
+    - Effect: Allow
+      Action: iam:PassRole
+      Resource: ${self:custom.prefixes.iamExecutionRole}${self:custom.prefixes.naming}-job-role
+
+custom:
+  accountId: 936672802726
+  taskDefinitionName: ${self:custom.prefixes.naming}-job
+  s3BucketName: serverless-deep-dream
+  jobDockerImage: herval/deepdream
+  prefixes:
+    naming: ${self:service}-${self:provider.stage}
+    lambdaArn: 'arn:aws:lambda:${self:provider.region}:${self:custom.accountId}:function:${self:custom.prefixes.naming}-'
+    taskDefinitionArn: arn:aws:ecs:${self:provider.region}:${self:custom.accountId}:task-definition/
+    iamExecutionRole: 'arn:aws:iam::${self:custom.accountId}:role/'
+
+plugins:
+  - serverless-step-functions
+  - serverless-stepfunction-validator
+
+functions:
+  launchJob:
+    handler: src/functions/launchJob.handler
+    environment:
+      TASK_DEFINITION_NAME: ${self:custom.taskDefinitionName}
+      FARGATE_EXEC_SUBNET_ONE:
+        Ref: 'PublicSubnetOne'
+      FARGATE_EXEC_SUBNET_TWO:
+        Ref: 'PublicSubnetTwo'
+  isJobFinished:
+    handler: src/functions/isJobFinished.handler
+
+stepFunctions:
+  stateMachines:
+    dream:
+      events:
+        - http:
+            path: dream
+            method: POST
+      name: ${self:custom.prefixes.naming}-dream
+      definition:
+        Comment: 'Run the deep dream algorithm on the provided image'
+        StartAt: LaunchJob
+        States:
+          LaunchJob:
+            Type: Task
+            Resource: ${self:custom.prefixes.lambdaArn}launchJob
+            Next: Wait10Seconds
+          Wait10Seconds:
+            Type: Wait
+            Seconds: 10
+            Next: IsJobFinished
+          IsJobFinished:
+            Type: Task
+            Resource: ${self:custom.prefixes.lambdaArn}isJobFinished
+            Next: JobFinishedChoice
+          JobFinishedChoice:
+            Type: Choice
+            Choices:
+              - Variable: '$.jobFinished'
+                BooleanEquals: true
+                Next: GoToEnd
+            Default: Wait10Seconds
+          GoToEnd:
+            Type: Pass
+            End: true
+
+resources:
+  Resources:
+    JobRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: ${self:custom.prefixes.naming}-job-role
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - ecs-tasks.amazonaws.com
+              Action:
+                - sts:AssumeRole
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+        Policies:
+          - PolicyName: ${self:custom.prefixes.naming}-job-policy
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - s3:GetObject
+                    - s3:PutObject
+                  Resource:
+                    - arn:aws:s3:::${self:custom.s3BucketName}/*
+    Cluster:
+      Type: AWS::ECS::Cluster
+      Properties:
+        ClusterName: ${self:custom.prefixes.naming}
+    JobTask:
+      Type: AWS::ECS::TaskDefinition
+      Properties:
+        Family: ${self:custom.taskDefinitionName}
+        RequiresCompatibilities:
+          - FARGATE
+        NetworkMode: awsvpc
+        ExecutionRoleArn:
+          Fn::GetAtt:
+            - JobRole
+            - Arn
+        Cpu: 1024
+        Memory: 2048
+        TaskRoleArn:
+          Fn::GetAtt:
+            - JobRole
+            - Arn
+        ContainerDefinitions:
+          - Name: ${self:custom.prefixes.naming}-job-container
+            Image: ${self:custom.jobDockerImage}
+            Cpu: 1024
+            Memory: 2048
+            Essential: true
+            # Environment:
+            #   - Name: DEBUG
+            #     Value: '*'
+            LogConfiguration:
+              LogDriver: awslogs
+              Options:
+                awslogs-group: /aws/ecs/${self:custom.prefixes.naming}
+                awslogs-region: ${self:provider.region}
+                awslogs-stream-prefix: ${self:custom.prefixes.naming}-job-container
+    LogGroup:
+      Type: AWS::Logs::LogGroup
+      Properties:
+        LogGroupName: /aws/ecs/${self:custom.prefixes.naming}
+
+    # https://github.com/nathanpeck/aws-cloudformation-fargate/blob/master/fargate-networking-stacks/public-vpc.yml
+    # VPC in which containers will be networked.
+    # It has two public subnets
+    # We distribute the subnets across the first two available subnets
+    # for the region, for high availability.
+    VPC:
+      Type: AWS::EC2::VPC
+      Properties:
+        EnableDnsSupport: true
+        EnableDnsHostnames: true
+        CidrBlock: '10.0.0.0/16'
+
+    # Two public subnets, where containers can have public IP addresses
+    PublicSubnetOne:
+      Type: AWS::EC2::Subnet
+      Properties:
+        AvailabilityZone:
+          Fn::Select:
+          - 0
+          - Fn::GetAZs: {Ref: 'AWS::Region'}
+        VpcId:
+          Ref: 'VPC'
+        CidrBlock: '10.0.0.0/24'
+        MapPublicIpOnLaunch: true
+    PublicSubnetTwo:
+      Type: AWS::EC2::Subnet
+      Properties:
+        AvailabilityZone:
+          Fn::Select:
+          - 1
+          - Fn::GetAZs: {Ref: 'AWS::Region'}
+        VpcId:
+          Ref: 'VPC'
+        CidrBlock: '10.0.1.0/24'
+        MapPublicIpOnLaunch: true
+
+    # Setup networking resources for the public subnets. Containers
+    # in the public subnets have public IP addresses and the routing table
+    # sends network traffic via the internet gateway.
+    InternetGateway:
+      Type: AWS::EC2::InternetGateway
+    GatewayAttachement:
+      Type: AWS::EC2::VPCGatewayAttachment
+      Properties:
+        VpcId:
+          Ref: 'VPC'
+        InternetGatewayId:
+          Ref: 'InternetGateway'
+    PublicRouteTable:
+      Type: AWS::EC2::RouteTable
+      Properties:
+        VpcId:
+          Ref: 'VPC'
+    PublicRoute:
+      Type: AWS::EC2::Route
+      DependsOn: GatewayAttachement
+      Properties:
+        RouteTableId:
+          Ref: 'PublicRouteTable'
+        DestinationCidrBlock: '0.0.0.0/0'
+        GatewayId:
+          Ref: 'InternetGateway'
+    PublicSubnetOneRouteTableAssociation:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties:
+        SubnetId:
+          Ref: PublicSubnetOne
+        RouteTableId:
+          Ref: PublicRouteTable
+    PublicSubnetTwoRouteTableAssociation:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties:
+        SubnetId:
+          Ref: PublicSubnetTwo
+        RouteTableId:
+          Ref: PublicRouteTable
+
+    # A security group for the containers we will run in Fargate.
+    # Two rules, allowing network traffic from a public facing load
+    # balancer and from other members of the security group.
+    #
+    # Remove any of the following ingress rules that are not needed.
+    # If you want to make direct requests to a container using its
+    # public IP address you'll need to add a security group rule
+    # to allow traffic from all IP addresses.
+    FargateContainerSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: Access to the Fargate containers
+        VpcId:
+          Ref: 'VPC'
+    EcsSecurityGroupIngressFromPublicALB:
+      Type: AWS::EC2::SecurityGroupIngress
+      Properties:
+        Description: Ingress from the public ALB
+        GroupId:
+          Ref: 'FargateContainerSecurityGroup'
+        IpProtocol: -1
+        SourceSecurityGroupId:
+          Ref: 'PublicLoadBalancerSG'
+    EcsSecurityGroupIngressFromSelf:
+      Type: AWS::EC2::SecurityGroupIngress
+      Properties:
+        Description: Ingress from other containers in the same security group
+        GroupId:
+          Ref: 'FargateContainerSecurityGroup'
+        IpProtocol: -1
+        SourceSecurityGroupId:
+          Ref: 'FargateContainerSecurityGroup'
+
+    # Load balancers for getting traffic to containers.
+    # This sample template creates one load balancer:
+    #
+    # - One public load balancer, hosted in public subnets that is accessible
+    #   to the public, and is intended to route traffic to one or more public
+    #   facing services.
+
+    # A public facing load balancer, this is used for accepting traffic from the public
+    # internet and directing it to public facing microservices
+    PublicLoadBalancerSG:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: Access to the public facing load balancer
+        VpcId:
+          Ref: 'VPC'
+        SecurityGroupIngress:
+            # Allow access to ALB from anywhere on the internet
+            - CidrIp: 0.0.0.0/0
+              IpProtocol: -1
+    PublicLoadBalancer:
+      Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+      Properties:
+        Scheme: internet-facing
+        LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '30'
+        Subnets:
+          # The load balancer is placed into the public subnets, so that traffic
+          # from the internet can reach the load balancer directly via the internet gateway
+          - Ref: PublicSubnetOne
+          - Ref: PublicSubnetTwo
+        SecurityGroups:
+          - Ref: 'PublicLoadBalancerSG'
+    # A dummy target group is used to setup the ALB to just drop traffic
+    # initially, before any real service target groups have been added.
+    DummyTargetGroupPublic:
+      Type: AWS::ElasticLoadBalancingV2::TargetGroup
+      Properties:
+        HealthCheckIntervalSeconds: 6
+        HealthCheckPath: /
+        HealthCheckProtocol: HTTP
+        HealthCheckTimeoutSeconds: 5
+        HealthyThresholdCount: 2
+        Name: ${self:custom.prefixes.naming}-drop-1
+        Port: 80
+        Protocol: HTTP
+        UnhealthyThresholdCount: 2
+        VpcId:
+          Ref: 'VPC'
+    PublicLoadBalancerListener:
+      Type: AWS::ElasticLoadBalancingV2::Listener
+      DependsOn:
+        - PublicLoadBalancer
+      Properties:
+        DefaultActions:
+          - TargetGroupArn:
+              Ref: 'DummyTargetGroupPublic'
+            Type: 'forward'
+        LoadBalancerArn:
+          Ref: 'PublicLoadBalancer'
+        Port: 80
+        Protocol: HTTP

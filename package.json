@@ -1,0 +1,27 @@
+{
+  "name": "serverless-deep-dream",
+  "version": "1.0.0",
+  "description": "Example of serverless application running deep dream",
+  "main": "handler.js",
+  "scripts": {
+    "lint": "./node_modules/eslint/bin/eslint.js ."
+  },
+  "devDependencies": {
+    "aws-sdk": "^2.331.0",
+    "eslint": "^5.6.1",
+    "eslint-config-airbnb-base": "^13.1.0",
+    "eslint-plugin-import": "^2.14.0",
+    "serverless-step-functions": "^1.7.2",
+    "serverless-stepfunction-validator": "^1.1.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ChristopheBougere/serverless-deep-dream.git"
+  },
+  "author": "Christophe Bougère",
+  "license": "Apache-2.0",
+  "bugs": {
+    "url": "https://github.com/ChristopheBougere/serverless-deep-dream/issues"
+  },
+  "homepage": "https://github.com/ChristopheBougere/serverless-deep-dream#readme"
+}
